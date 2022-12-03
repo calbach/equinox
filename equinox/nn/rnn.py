@@ -2,6 +2,7 @@ import math
 from typing import Optional
 
 import jax
+from jax.experimental import rnn
 import jax.nn as jnn
 import jax.numpy as jnp
 import jax.random as jrandom
@@ -51,8 +52,10 @@ class GRUCell(Module):
     ):
         """**Arguments:**
 
-        - `input_size`: The dimensionality of the input vector at each time step.
-        - `hidden_size`: The dimensionality of the hidden state passed along between
+        - `input_size`: The dimensionality of the input vector at each time
+        step.
+        - `hidden_size`: The dimensionality of the hidden state passed along
+        between
             time steps.
         - `use_bias`: Whether to add on a bias after each update.
         - `key`: A `jax.random.PRNGKey` used to provide randomness for parameter
@@ -89,15 +92,18 @@ class GRUCell(Module):
     ):
         """**Arguments:**
 
-        - `input`: The input, which should be a JAX array of shape `(input_size,)`.
+        - `input`: The input, which should be a JAX array of shape
+        `(input_size,)`.
         - `hidden`: The hidden state, which should be a JAX array of shape
             `(hidden_size,)`.
-        - `key`: Ignored; provided for compatibility with the rest of the Equinox API.
+        - `key`: Ignored; provided for compatibility with the rest of the
+        Equinox API.
             (Keyword only argument.)
 
         **Returns:**
 
-        The updated hidden state, which is a JAX array of shape `(hidden_size,)`.
+        The updated hidden state, which is a JAX array of shape
+        `(hidden_size,)`.
         """
         if self.use_bias:
             bias = self.bias
@@ -136,69 +142,109 @@ class LSTMCell(Module):
         ```
     """
 
-    weight_ih: Array
-    weight_hh: Array
+    weights: Array
     bias: Optional[Array]
     input_size: int = static_field()
     hidden_size: int = static_field()
     use_bias: bool = static_field()
+    use_experimental_kernel: bool = static_field()
 
     def __init__(
         self,
         input_size: int,
         hidden_size: int,
         use_bias: bool = True,
+        use_experimental_kernel: bool = False,
         *,
         key: "jax.random.PRNGKey",
         **kwargs
     ):
         """**Arguments:**
 
-        - `input_size`: The dimensionality of the input vector at each time step.
-        - `hidden_size`: The dimensionality of the hidden state passed along between
+        - `input_size`: The dimensionality of the input vector at each time
+        step.
+        - `hidden_size`: The dimensionality of the hidden state passed along
+        between
             time steps.
-        - `use_bias`: Whether to add on a bias after each update.
+        - `use_bias`: Whether to add on a bias after each update. Not applicable
+            if use_experimental_kernel is enabled.
+        - `use_experimental_kernel`: Whether to use an exeprimental CUDNN-backed
+            LSTM kernel.
         - `key`: A `jax.random.PRNGKey` used to provide randomness for parameter
             initialisation. (Keyword only argument.)
         """
         super().__init__(**kwargs)
 
-        ihkey, hhkey, bkey = jrandom.split(key, 3)
-        lim = math.sqrt(1 / hidden_size)
-
-        self.weight_ih = jrandom.uniform(
-            ihkey, (4 * hidden_size, input_size), minval=-lim, maxval=lim
-        )
-        self.weight_hh = jrandom.uniform(
-            hhkey, (4 * hidden_size, hidden_size), minval=-lim, maxval=lim
-        )
-        if use_bias:
-            self.bias = jrandom.uniform(
-                bkey, (4 * hidden_size,), minval=-lim, maxval=lim
-            )
-        else:
-            self.bias = None
-
         self.input_size = input_size
         self.hidden_size = hidden_size
+        self.bias = None
         self.use_bias = use_bias
+        self.use_experimental_kernel = use_experimental_kernel
+
+        if use_experimental_kernel:
+            self.weights = rnn.init_lstm_weight(
+                key,
+                input_size,
+                hidden_size=hidden_size,
+                num_layers=1,
+                bidirectional=False,
+            )
+        else:
+            ihkey, hhkey, bkey = jrandom.split(key, 3)
+            lim = math.sqrt(1 / hidden_size)
+
+            self.weights = [
+                    jrandom.uniform(
+                        ihkey, (4 * hidden_size, input_size), minval=-lim, maxval=lim
+                    ),
+                    jrandom.uniform(
+                        hhkey, (4 * hidden_size, hidden_size), minval=-lim, maxval=lim
+                    ),
+                ]
+            if use_bias:
+                self.bias = jrandom.uniform(
+                    bkey, (4 * hidden_size,), minval=-lim, maxval=lim
+                )
 
     def __call__(self, input, hidden, *, key=None):
         """**Arguments:**
 
-        - `input`: The input, which should be a JAX array of shape `(input_size,)`.
-        - `hidden`: The hidden state, which should be a 2-tuple of JAX arrays, each of
+        - `input`: The input, which should be a JAX array of shape
+        `(input_size,)`.
+        - `hidden`: The hidden state, which should be a 2-tuple of JAX arrays,
+        each of
             shape `(hidden_size,)`.
-        - `key`: Ignored; provided for compatibility with the rest of the Equinox API.
+        - `key`: Ignored; provided for compatibility with the rest of the
+        Equinox API.
             (Keyword only argument.)
 
         **Returns:**
 
-        The updated hidden state, which is a 2-tuple of JAX arrays, each of shape
+        The updated hidden state, which is a 2-tuple of JAX arrays, each of
+        shape
         `(hidden_size,)`.
         """
         h, c = hidden
-        lin = self.weight_ih @ input + self.weight_hh @ h
+
+        if self.use_experimental_kernel:
+            _, h, c = rnn.lstm(
+                # rnn.lstm supports processing a batch + sequence dimension as well.
+                # Treat both dimensions as 1 for compatibility with a single input,
+                # per LSTMCell.
+                jnp.expand_dims(input, (0, 1)),
+                h,
+                c,
+                self.weights,
+                seq_lengths=jnp.array([1]),
+                input_size=self.input_size,
+                hidden_size=self.hidden_size,
+                num_layers=1,
+                dropout=False,
+                bidirectional=False,
+            )
+            return (h, c)
+
+        lin = self.weights[0] @ input + self.weights[1] @ h
         if self.use_bias:
             lin = lin + self.bias
         i, f, g, o = jnp.split(lin, 4)

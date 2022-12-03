@@ -106,8 +106,11 @@ def test_gru_cell(getkey):
         assert h.shape == (8,)
 
 
-def test_lstm_cell(getkey):
-    gru = eqx.nn.LSTMCell(2, 8, key=getkey())
+@pytest.mark.parametrize("use_experimental_kernel", [True, False])
+def test_lstm_cell(getkey, use_experimental_kernel):
+    gru = eqx.nn.LSTMCell(
+        2, 8, key=getkey(), use_experimental_kernel=use_experimental_kernel
+    )
     h = jrandom.normal(getkey(), (8,)), jrandom.normal(getkey(), (8,))
     x = jrandom.normal(getkey(), (5, 2))
     for xi in x:
